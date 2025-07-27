@@ -20,4 +20,4 @@ RUN pip install --no-cache-dir flask pdfplumber
 EXPOSE 5000
 
 # Run the application
-CMD ["python", "API.py"]
+CMD ["python", "APIs.py"]

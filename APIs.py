@@ -46,6 +46,7 @@ def Remove():
         return jsonify({'error': str(e)}),500
     
 #This API is for getting title and other headings from the pdfs
+
 # --- Configuration Constants ---
 # Determines how much larger a font must be than body text to be considered a heading.
 FONT_SIZE_MULTIPLIER = 1.2
@@ -243,4 +244,4 @@ def get_pdf_outline():
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True,host="0.0.0.0")
