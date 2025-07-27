@@ -17,7 +17,7 @@ COPY . .
 RUN pip install --no-cache-dir flask pdfplumber
 
 # Expose the port the app runs on
-EXPOSE 5000
+# EXPOSE 5000
 
 # Run the application
-CMD ["python", "APIs.py"]
+CMD ["python", "main.py"]
