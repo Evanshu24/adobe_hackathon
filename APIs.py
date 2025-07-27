@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from collections import defaultdict
 import os
 import re
 import pdfplumber
@@ -45,160 +46,201 @@ def Remove():
         return jsonify({'error': str(e)}),500
     
 #This API is for getting title and other headings from the pdfs
-HEADING_THRESHOLD_MULTIPLIER = 1.2
-MIN_HEADING_WORDS = 1 # Lowered to allow short headings
-MAX_HEADING_WORDS = 20
+# --- Configuration Constants ---
+# Determines how much larger a font must be than body text to be considered a heading.
+FONT_SIZE_MULTIPLIER = 1.2
+# Defines the valid word count range for a line to be a heading.
+HEADING_MIN_WORDS = 1
+HEADING_MAX_WORDS = 20
 
-# --- NEW: Function to clean duplicated characters ---
-def clean_text(text):
+
+def _sanitize_text(text: str) -> str:
     """
-    Removes character duplication used for faux-bolding in some PDFs.
-    Example: "LLeeccttuurree" -> "Lecture"
+    Cleans text by removing duplicated consecutive words that can appear in PDF extraction.
+    e.g., "The The IPO IPO" becomes "The IPO". This is safer than character-level cleaning.
     """
-    return re.sub(r'(.)\1', r'\1', text)
+    words = text.split()
+    if not words:
+        return ""
+    
+    # Use a list to store the unique words in order
+    unique_words = [words[0]]
+    for i in range(1, len(words)):
+        if words[i] != words[i-1]:
+            unique_words.append(words[i])
+            
+    return " ".join(unique_words)
+
+def _extract_content_from_pdf(file_path: str) -> tuple[list, dict]:
+    """
+    Opens a PDF and extracts all text lines along with their properties.
+
+    Returns:
+        A tuple containing:
+        - A list of all text block dictionaries.
+        - A dictionary of font size frequencies.
+    """
+    text_blocks = []
+    font_size_counts = defaultdict(int)
+
+    with pdfplumber.open(file_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            words = page.extract_words(extra_attrs=["fontname", "size"])
+            if not words:
+                continue
+            
+            # Group words into lines using their vertical position and font size as a key.
+            lines_on_page = defaultdict(list)
+            for word in words:
+                key = (round(word["top"], 1), round(word["size"], 1))
+                lines_on_page[key].append(word)
+                font_size_counts[round(word["size"], 1)] += 1
+
+            # Reconstruct each line from its words.
+            for (y_pos, size), line_words in lines_on_page.items():
+                line_words.sort(key=lambda w: w["x0"])
+                raw_text = " ".join(w["text"] for w in line_words)
+                cleaned_text = _sanitize_text(raw_text).strip()
+                if cleaned_text:
+                    text_blocks.append({
+                        "text": cleaned_text, "size": size, "page": page_num, "y_pos": y_pos
+                    })
+    
+    # Sort blocks by page and position for sequential processing.
+    text_blocks.sort(key=lambda b: (b["page"], b["y_pos"]))
+    return text_blocks, dict(font_size_counts)
+
+def _identify_heading_levels(font_counts: dict) -> dict:
+    """
+    Analyzes font frequencies to determine which sizes correspond to headings.
+
+    Returns:
+        A dictionary mapping font sizes to heading levels (e.g., {18.0: "H1"}).
+    """
+    if not font_counts:
+        return {}
+
+    # The most frequent font size is assumed to be the body text.
+    body_text_size = max(font_counts, key=font_counts.get)
+    
+    # Identify heading sizes as those significantly larger than the body text.
+    heading_font_sizes = sorted(
+        [size for size in font_counts if size >= body_text_size * FONT_SIZE_MULTIPLIER],
+        reverse=True
+    )
+    
+    # Map the top 3 heading sizes to H1, H2, and H3.
+    return {size: f"H{i+1}" for i, size in enumerate(heading_font_sizes[:3])}
+
+def _merge_adjacent_headings(heading_list: list) -> list:
+    """
+    Merges multi-line headings into a single heading entry.
+    """
+    if not heading_list:
+        return []
+
+    final_headings = []
+    i = 0
+    while i < len(heading_list):
+        current = heading_list[i]
+        
+        # Look ahead to merge consecutive lines of the same heading.
+        j = i + 1
+        while j < len(heading_list):
+            next_heading = heading_list[j]
+            if (current["level"] == next_heading["level"] and
+                current["page"] == next_heading["page"]):
+                
+                # Check if the vertical gap is small enough to indicate a multi-line heading.
+                vertical_gap = next_heading["y_pos"] - heading_list[j-1]["y_pos"]
+                if 0 < vertical_gap < (current["size"] * 1.5):
+                    current["text"] += " " + next_heading["text"]
+                    j += 1
+                else:
+                    break # The gap is too large, it's a separate heading.
+            else:
+                break
+        
+        # Clean up temporary keys before adding to the final list.
+        del current["size"]
+        del current["y_pos"]
+        final_headings.append(current)
+        i = j # Skip past the already merged items.
+        
+    return final_headings
+
+def _find_document_title(outline: list) -> str:
+    """
+    Selects the most appropriate title from the final outline.
+    """
+    if not outline:
+        return "Untitled"
+
+    # Default to the very first heading as a fallback.
+    title = outline[0]["text"]
+    
+    # Search for the highest-ranking heading (H1, then H2) to use as the title.
+    for level in ["H1", "H2"]:
+        found_title = next((item["text"] for item in outline if item["level"] == level), None)
+        if found_title:
+            title = found_title
+            return title # Return as soon as the best level is found.
+    
+    return title
+
+# --- Main API Endpoint ---
 
 @app.route('/ExtractData', methods=['POST'])
-def extract_outline():
+def get_pdf_outline():
     """
-    API endpoint to extract a structured outline from a PDF file.
-    Expects a JSON payload with a "filename" key.
+    Main API endpoint to process a PDF and return its structured outline.
     """
-    filename = request.json.get('filename')
-    if filename=='':
-        return jsonify({"error": "Filename is required"}), 400
+    file_name = request.json.get('filename')
 
-    filepath = os.path.join(UPLOAD_Folder, filename)
+    file_path = os.path.join(UPLOAD_Folder, file_name)
+    if not os.path.exists(file_path):
+        return jsonify({"error": f"File '{file_name}' not found"}), 404
 
     try:
-        # --- 1. Extract Text Objects and Font Statistics ---
-        all_text_objects = []
-        font_stats = {}
-        with pdfplumber.open(filepath) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
-                words = page.extract_words(extra_attrs=['fontname', 'size'])
-                if not words:
-                    continue
+        # 1. Extract text and font data from the PDF.
+        all_blocks, font_counts = _extract_content_from_pdf(file_path)
+        if not all_blocks:
+            return jsonify({"title": "Untitled", "outline": [], "error": "No text could be extracted."})
 
-                lines = {}
-                for word in words:
-                    print(word)
-                    print('\n')
-                    y_pos = round(word['top'], 1)
-                    size = round(word['size'], 1)
-                    line_key = (page_num, y_pos, size)
+        # 2. Deduplicate text blocks to handle redundant text.
+        unique_blocks = []
+        seen_text_keys = set()
+        for block in all_blocks:
+            key = re.sub(r'\\s+', '', block["text"]).lower()
+            if key not in seen_text_keys:
+                unique_blocks.append(block)
+                seen_text_keys.add(key)
+        
+        # 3. Identify which font sizes correspond to heading levels.
+        size_to_level_map = _identify_heading_levels(font_counts)
+        if not size_to_level_map:
+             return jsonify({"title": "Untitled", "outline": [], "error": "Could not determine heading structure."})
 
-                    if line_key not in lines:
-                        lines[line_key] = []
-                    lines[line_key].append({'text': word['text'], 'x0': word['x0']})
-                    font_stats[size] = font_stats.get(size, 0) + 1
-
-                for (p, y, s), word_list in lines.items():
-                    word_list.sort(key=lambda w: w['x0'])
-                    # Apply text cleaning right after joining words
-                    line_text = clean_text(' '.join([w['text'] for w in word_list]).strip())
-                    if line_text:
-                        all_text_objects.append({
-                            "text": line_text,
-                            "size": s,
-                            "page": p,
-                            "y_pos": y
-                        })
-
-        if not all_text_objects:
-            return jsonify({"title": "Untitled", "outline": [], "error": "No text could be extracted."}), 200
-
-        all_text_objects.sort(key=lambda x: (x['page'], x['y_pos']))
-
-        # --- 2. Deduplicate Text Objects ---
-        unique_objects = []
-        seen_texts = set()
-        for obj in all_text_objects:
-            text_key = re.sub(r'\s+', '', obj['text']).lower()
-            if text_key not in seen_texts:
-                unique_objects.append(obj)
-                seen_texts.add(text_key)
-
-        # --- 3. Analyze Fonts to Identify Heading Levels ---
-        if not font_stats:
-            return jsonify({"title": "Untitled", "outline": [], "error": "No font statistics found."}), 200
-
-        sorted_by_frequency = sorted(font_stats.items(), key=lambda x: -x[1])
-        body_font_size = sorted_by_frequency[0][0] if sorted_by_frequency else 12.0
-
-        heading_threshold = body_font_size * HEADING_THRESHOLD_MULTIPLIER
-        heading_fonts = sorted([size for size in font_stats if size >= heading_threshold], reverse=True)
-        font_to_level = {size: f"H{i+1}" for i, size in enumerate(heading_fonts[:3])}
-
-        # --- 4. Build the Initial (Unmerged) Outline ---
-        structured_outline = []
-        for obj in unique_objects:
-            level = font_to_level.get(obj['size'])
+        # 4. Filter for text blocks that are likely headings.
+        heading_candidates = []
+        for block in unique_blocks:
+            level = size_to_level_map.get(block["size"])
             if level:
-                text = obj['text']
-                word_count = len(text.split())
-                if (MIN_HEADING_WORDS <= word_count <= MAX_HEADING_WORDS and
-                    not text.strip().endswith('.') and
-                    any(c.isalpha() for c in text)):
-                    structured_outline.append({
-                        "level": level,
-                        "text": text,
-                        "page": obj['page'],
-                        "y_pos": obj['y_pos'], # Keep y_pos for merging logic
-                        "size": obj['size'] # Keep size for merging logic
-                    })
+                word_count = len(block["text"].split())
+                # Apply filters to ensure the line looks like a heading.
+                if (HEADING_MIN_WORDS <= word_count <= HEADING_MAX_WORDS and
+                    not block["text"].strip().endswith(".") and
+                    any(c.isalpha() for c in block["text"])):
+                    heading_candidates.append({**block, "level": level})
 
-        # --- 5. NEW: Merge Multi-Line Headings ---
-        if not structured_outline:
-            return jsonify({"title": "Untitled", "outline": []}), 200
+        # 5. Merge multi-line headings and select the title.
+        final_outline = _merge_adjacent_headings(heading_candidates)
+        document_title = _find_document_title(final_outline)
 
-        merged_outline = []
-        i = 0
-        while i < len(structured_outline):
-            current_heading = structured_outline[i]
-            j = i + 1
-            # Check if the next heading can be merged with the current one
-            while (j < len(structured_outline) and
-                   structured_outline[j]['level'] == current_heading['level'] and
-                   structured_outline[j]['page'] == current_heading['page']):
-                   # Check vertical proximity
-                   # A reasonable gap is less than the font size itself
-                   vertical_gap = structured_outline[j]['y_pos'] - structured_outline[j-1]['y_pos']
-                   if 0 < vertical_gap < (current_heading['size'] * 1.5):
-                        current_heading['text'] += " " + structured_outline[j]['text']
-                        j += 1
-                   else:
-                       break # Gap is too large, stop merging
-            
-            # Remove temporary keys before adding to final list
-            del current_heading['y_pos']
-            del current_heading['size']
-            merged_outline.append(current_heading)
-            i = j # Move main index past the merged items
-
-        # --- 6. Determine Title from Final Merged Outline ---
-        title = "Untitled" # Start with a default value
-
-        if merged_outline:
-            # As a fallback, set the title to the very first heading found
-            title = merged_outline[0]['text']
-            
-            # Now, search for the best possible title in order of importance
-            for level_to_find in ['H1', 'H2']:
-                # Look for the first heading that matches the current level in the loop
-                found_heading = next((item['text'] for item in merged_outline if item['level'] == level_to_find), None)
-                
-                if found_heading:
-                    title = found_heading
-                    break # Stop searching as we've found the highest-ranking title
-                
-        return jsonify({
-            "title": title,
-            "outline": merged_outline
-        }), 200
+        return jsonify({"title": document_title, "outline": final_outline}), 200
 
     except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
-    
 if __name__ == '__main__':
     app.run(debug=True)
