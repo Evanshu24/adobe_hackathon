@@ -1,18 +1,14 @@
-#These APIs are made for next round for web integration
-
+#These functions are made for next round for web integration
 from flask import Flask, request, jsonify
 from collections import defaultdict
 import os
 import re
 import pdfplumber
 
-app = Flask(__name__)
-
-UPLOAD_Folder='UPLOADS'
+UPLOAD_Folder='input'
 os.makedirs(UPLOAD_Folder,exist_ok=True)
 
-#This API adds pdfs to UPLOADS folder
-@app.route('/AddFile', methods=['POST'])
+
 def Add():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part in the request'}), 500
@@ -33,8 +29,6 @@ def Add():
 
     return jsonify({'message': f'{file.filename} uploaded successfully'}), 200
 
-#This API will delete pdfs from UPLOADS folder
-@app.route('/RemoveFile', methods=['POST'])
 def Remove():
     filename=request.json.get('filename')
     filepath=os.path.join(UPLOAD_Folder,filename)
@@ -47,7 +41,6 @@ def Remove():
     except Exception as e:
         return jsonify({'error': str(e)}),500
     
-#This API is for getting title and other headings from the pdfs
 
 FONT_SIZE_MULTIPLIER = 1.2
 HEADING_MIN_WORDS = 1
@@ -178,16 +171,14 @@ def _find_document_title(pdf):
     title_words.sort(key=lambda w: (w['top'], w['x0']))
     return _sanitize_text(" ".join(w['text'] for w in title_words))
 
-@app.route('/ExtractData', methods=['POST'])
-def get_pdf_outline():
-    file_name = request.json.get('filename')
+def get_pdf_outline(file_name):
+    # file_name = request.json.get('filename')
     if not file_name:
-        return jsonify({"error": "Filename is required"}), 400
+        return {"error": "Filename is required"}
 
     file_path = os.path.join(UPLOAD_Folder, file_name)
     if not os.path.exists(file_path):
-        return jsonify({"error": f"File '{file_name}' not found"}), 404
-
+        return {"error": f"File '{file_name}' not found"}
     try:
         with pdfplumber.open(file_path) as pdf:
             document_title = _find_document_title(pdf)
@@ -197,13 +188,11 @@ def get_pdf_outline():
                 final_outline = _extract_visual_outline(pdf)
 
             if final_outline is None:
-                return jsonify({"title": document_title, "outline": [], "error": "Could not determine outline for this document."})
+                return {"title": document_title, "outline": [], "error": "Could not determine outline for this document."}
 
-        return jsonify({"title": document_title, "outline": final_outline}), 200
+        return {"title": document_title, "outline": final_outline}
 
     except Exception as e:
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
-
-
-if __name__ == '__main__':
-    app.run(debug=True,host="0.0.0.0")
+        return {"error": f"An unexpected error occurred: {str(e)}"}
+# if __name__ == '__main__':
+#     app.run(debug=True,host="0.0.0.0")
